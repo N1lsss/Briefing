@@ -17,6 +17,7 @@ import argparse, html, json, re, sys, time, webbrowser
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo
+from analysis import render_markets, render_themes, enrich, timeline, event_extra
 
 PARIS = ZoneInfo("Europe/Paris")
 CACHE = Path(".cache")
@@ -41,7 +42,7 @@ FEEDS = {
 
 # thème : (regex, transmission habituelle vers les actifs)
 THEMES = {
-    "Banques centrales & taux": (r"\bfed\b|powell|\becb\b|lagarde|\bbce\b|\bboe\b|bank of england|rate cut|rate hike|taux directeur|baisse des taux",
+    "Banques centrales & taux": (r"\bfed\b(?! up)|powell|\becb\b|lagarde|\bbce\b|\bboe\b|bank of england|rate cut|rate hike|taux directeur|baisse des taux",
                                  "Ton restrictif : USD ↑, XAUUSD ↓, Nasdaq ↓. Ton accommodant : l'inverse."),
     "Inflation & croissance": (r"inflation|\bcpi\b|\bpce\b|recession|récession|\bgdp\b|\bpib\b|jobs report|payroll",
                                "Inflation forte : rendements ↑, actions growth ↓, or ↓. Croissance faible : USD ↓ puis risk-off possible."),
@@ -141,13 +142,16 @@ def load_prices():
     res = {}
     for label, tk in {**ASSETS, **CONTEXT}.items():
         try:
-            h = yf.Ticker(tk).history(period="1mo", interval="1d")["Close"].dropna()
-            last, prev = float(h.iloc[-1]), float(h.iloc[-2])
-            wk = float(h.iloc[-6]) if len(h) >= 6 else None
+            df = yf.Ticker(tk).history(period="6mo", interval="1d").dropna(subset=["Close"])
+            c = [float(x) for x in df["Close"]]
+            last, prev = c[-1], c[-2]
+            wk = c[-6] if len(c) >= 6 else None
+            hist = {"dates": [d.strftime("%d/%m") for d in df.index], "close": c,
+                    "high": [float(x) for x in df["High"]], "low": [float(x) for x in df["Low"]]}
             if "10 ans" in label:  # rendement : variation en points de base
-                res[label] = {"last": last, "d1": (last - prev) * 100, "w": (last - wk) * 100 if wk else None, "unit": "pb"}
+                res[label] = {"last": last, "d1": (last - prev) * 100, "w": (last - wk) * 100 if wk else None, "unit": "pb", "hist": hist}
             else:
-                res[label] = {"last": last, "d1": (last / prev - 1) * 100, "w": (last / wk - 1) * 100 if wk else None, "unit": "%"}
+                res[label] = {"last": last, "d1": (last / prev - 1) * 100, "w": (last / wk - 1) * 100 if wk else None, "unit": "%", "hist": hist}
         except Exception as e:
             print(f"[prix {label}] indisponible : {e}", file=sys.stderr)
     return res
@@ -163,7 +167,8 @@ def load_news(hours):
                 p = en.get("published_parsed") or en.get("updated_parsed")
                 dt = datetime(*p[:6], tzinfo=timezone.utc) if p else datetime.now(timezone.utc)
                 if dt >= limit:
-                    items.append({"source": src, "title": en.get("title", ""), "link": en.get("link", "#"), "dt": dt})
+                    items.append({"source": src, "title": en.get("title", ""), "link": en.get("link", "#"), "dt": dt,
+                                  "summary": re.sub(r"<[^>]+>", " ", en.get("summary", ""))})
         except Exception as e:
             print(f"[rss {src}] indisponible : {e}", file=sys.stderr)
     return items
@@ -175,8 +180,10 @@ def group_themes(news):
         hits = [n for n in news if re.search(pat, n["title"], re.I)]
         if hits:
             sources = {n["source"] for n in hits}
-            out[theme] = {"transmission": transmission, "sources": sources,
-                          "items": sorted(hits, key=lambda n: n["dt"], reverse=True)[:4]}
+            uniq = {}
+            for n in sorted(hits, key=lambda n: n["dt"], reverse=True):
+                uniq.setdefault(n["title"].strip().lower(), n)  # supprime les doublons de titre
+            out[theme] = {"transmission": transmission, "sources": sources, "items": list(uniq.values())[:4]}
     return dict(sorted(out.items(), key=lambda kv: -len(kv[1]["sources"])))
 
 
@@ -190,10 +197,25 @@ def demo():
            ev(20, 0, "USD", "FOMC Member Speaks", "Medium", "—", "—"),
            ev(9, 30, "GBP", "Official Bank Rate", "High", "4.00%", "4.00%", d=2),
            ev(14, 15, "EUR", "Main Refinancing Rate", "High", "2.15%", "2.15%", d=3)]
-    prices = {k: {"last": 100 + i * 37.3, "d1": (-1) ** i * 0.4 * (i + 1) / 2, "w": (-1) ** (i + 1) * 0.9, "unit": "%"}
-              for i, k in enumerate({**ASSETS, **CONTEXT})}
+    import random
+    random.seed(7)
+    def walk(base):
+        v, c = base, []
+        for _ in range(120):
+            v *= 1 + random.gauss(0.0003, 0.008)
+            c.append(v)
+        dts = [(day - timedelta(days=120 - i)).strftime("%d/%m") for i in range(120)]
+        return {"dates": dts, "close": c, "high": [x * 1.004 for x in c], "low": [x * 0.996 for x in c]}
+    prices = {}
+    for i, k in enumerate({**ASSETS, **CONTEXT}):
+        hh = walk([20000, 5800, 8000, 2650, 1.08, 1.30, 104, 4.2, 17, 70][i])
+        c = hh["close"]
+        prices[k] = {"last": c[-1], "d1": (c[-1] / c[-2] - 1) * 100, "w": (c[-1] / c[-6] - 1) * 100, "unit": "%", "hist": hh}
     now = datetime.now(timezone.utc)
-    news = [{"source": s, "title": t, "link": "#", "dt": now} for s, t in [
+    DEMO_SUM = ("Markets reacted strongly on Tuesday as yields rose 12 basis points to 4.35% while the dollar gained 0.4%. "
+                "Analysts expect the central bank to hold rates at 4.00% through December after a $2.5 billion bond sale. "
+                "Investors are now watching inflation data due this week for further direction.")
+    news = [{"source": s, "title": t, "link": "#", "dt": now, "summary": DEMO_SUM} for s, t in [
         ("Fed", "Powell signals patience on rate cut path"), ("BBC Business", "Fed rate cut hopes fade after inflation data"),
         ("CNBC Économie", "Treasury yields climb as CPI looms"), ("BBC Monde", "Ceasefire talks stall as missile strikes continue"),
         ("France 24", "Guerre en Ukraine : nouvelles sanctions annoncées"), ("Guardian Business", "Oil jumps on OPEC supply worries")]]
@@ -212,6 +234,12 @@ td:first-child,th:first-child{text-align:left}.wrap{overflow-x:auto}.up{color:va
 .ev{display:flex;gap:12px}.time{font-weight:600;min-width:52px}.badge{font-size:11px;padding:1px 7px;border-radius:9px;border:1px solid;margin-left:6px}
 .High{color:var(--hi)}.Medium{color:var(--md)}.Low{color:var(--lo)}.meta{color:var(--mut);font-size:13px}
 .sc{font-size:13.5px;margin-top:6px}.sc b{font-weight:600}a{color:inherit}li{margin:4px 0}.note{color:var(--mut);font-size:12.5px;margin-top:30px}
+:root{--acc:#2563eb}@media(prefers-color-scheme:dark){:root{--acc:#6ea8ff}}
+.ch{width:100%;height:auto;display:block;margin:8px 0}.gr{stroke:var(--bd)}.tx{fill:var(--mut);font-size:10px}.ar{fill:var(--acc);opacity:.08}
+.cl{fill:none;stroke:var(--mut);stroke-width:1.4}.c5{fill:none;stroke:var(--acc);stroke-width:2.4}.sm{fill:none;stroke:var(--md);stroke-width:1;stroke-dasharray:3 3}
+.lv{stroke:var(--mut);stroke-dasharray:2 4}.dot{fill:var(--acc)}.pill{font-size:12px;padding:2px 9px;border-radius:9px;border:1px solid;margin:0 6px}
+.pill.up{color:var(--up)}.pill.dn{color:var(--dn)}.pill.neu{color:var(--md)}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(280px,1fr));gap:10px}
+.chip{display:inline-block;font-size:12px;border:1px solid var(--bd);border-radius:8px;padding:1px 7px;margin:2px 4px 2px 0}.art{border-top:1px solid var(--bd);margin-top:10px;padding-top:8px}.art p{margin:6px 0}.tl{padding:4px 0;border-bottom:1px solid var(--bd)}.tl b{display:inline-block;min-width:48px}
 """
 
 
@@ -248,7 +276,7 @@ def render_event(e):
         sc = f'<div class="sc"><b>{l1} :</b> {html.escape(hot)}<br><b>{l2} :</b> {html.escape(cold)}</div>'
     return (f'<div class="card ev"><div class="time">{e["dt"]:%H:%M}</div><div style="flex:1">'
             f'<b>{html.escape(ccy)}</b> {html.escape(e["title"])}<span class="badge {e["impact"]}">{html.escape(e["impact"])}</span>'
-            f'<div class="meta">Prévision : {html.escape(e["forecast"])} · Précédent : {html.escape(e["previous"])}</div>{sc}</div></div>')
+            f'<div class="meta">Prévision : {html.escape(e["forecast"])} · Précédent : {html.escape(e["previous"])}</div>{event_extra(e)}{sc}</div></div>')
 
 
 def render_agenda(events, by_day):
@@ -264,19 +292,6 @@ def render_agenda(events, by_day):
         out.append(render_event(e))
     return "".join(out)
 
-
-def render_themes(themes):
-    if not themes:
-        return '<div class="card meta">Aucun thème majeur détecté dans les flux.</div>'
-    out = []
-    for name, t in themes.items():
-        n = len(t["sources"])
-        conf = f"confirmé par {n} sources" if n >= 2 else "1 seule source : à recouper"
-        lis = "".join(f'<li><a href="{html.escape(i["link"])}" target="_blank" rel="noopener">{html.escape(i["title"])}</a> '
-                      f'<span class="meta">({html.escape(i["source"])})</span></li>' for i in t["items"])
-        out.append(f'<div class="card"><b>{html.escape(name)}</b> <span class="meta">· {conf}</span>'
-                   f'<div class="sc"><b>Transmission :</b> {html.escape(t["transmission"])}</div><ul>{lis}</ul></div>')
-    return "".join(out)
 
 
 def key_points(events, prices):
@@ -320,9 +335,9 @@ def build(mode, use_demo, nav=""):
         agenda_title = "Semaine à venir : annonces à fort impact (heure de Paris)"
     body = [nav, f"<h1>{title}</h1><p class='sub'>Généré le {now:%d/%m/%Y à %H:%M} (Paris)</p>",
             "<h2>À retenir</h2>", f'<div class="card">{key_points(events, prices)}</div>',
-            f"<h2>{'Marchés : bilan' if mode == 'weekly' else 'Marchés : clôtures et variations'}</h2>", render_prices(prices),
-            f"<h2>{agenda_title}</h2>", render_agenda(events, by_day),
-            f"<h2>Actualités et géopolitique {'(7 jours)' if mode == 'weekly' else '(36 h)'}</h2>", render_themes(group_themes(news)),
+            f"<h2>{'Marchés : bilan' if mode == 'weekly' else 'Marchés : clôtures et variations'}</h2>", render_markets(prices, ASSETS, CONTEXT, cal, now),
+            f"<h2>{agenda_title}</h2>", (timeline(events) if mode == "daily" else "") + render_agenda(events, by_day),
+            f"<h2>Actualités et géopolitique {'(7 jours)' if mode == 'weekly' else '(36 h)'}</h2>", render_themes(enrich(group_themes(news), use_demo)),
             '<p class="note">Outil d\'aide à la préparation, pas un conseil en investissement. Les scénarios sont conditionnels '
             "et dépendent du régime de marché (attentes de taux, aversion au risque). Vérifie toujours les données sources. "
             "Calendrier : flux ForexFactory non officiel ; prix : Yahoo Finance (différés).</p>"]
