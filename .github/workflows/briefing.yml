@@ -29,6 +29,8 @@ jobs:
           cache: pip
       - run: pip install -r requirements.txt
       - run: python briefing.py site
+        env:
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
       - uses: actions/configure-pages@v5
       - uses: actions/upload-pages-artifact@v3
         with:
